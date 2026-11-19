@@ -1,0 +1,76 @@
+# Keeps the 3.3.5 branch current with the official TrinityCore 3.3.5 while
+# keeping our own changes (Eluna and anything else committed here): upstream is
+# merged on top, never reset. The Eluna submodule follows trinity-flux/Eluna.
+# Nothing is pushed unless the merged tree builds.
+#
+# Pushing a merge that touches .github/workflows needs a token with the
+# "workflows" permission, so set the SYNC_TOKEN secret (fine-grained PAT with
+# Contents + Workflows read/write on this repo). Without it, those merges fail.
+name: sync-upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * *'
+
+permissions:
+  contents: write
+
+concurrency: sync-upstream
+
+jobs:
+  sync:
+    if: github.repository == 'trinity-flux/TrinityCore'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 3.3.5
+          fetch-depth: 0
+          submodules: recursive
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Merge TrinityCore 3.3.5 and the latest Eluna
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898233+github-actions[bot]@users.noreply.github.com"
+          before=$(git rev-parse HEAD)
+          git remote add upstream https://github.com/TrinityCore/TrinityCore.git
+          git fetch upstream 3.3.5
+          if ! git merge --no-edit -m "Merge TrinityCore 3.3.5" upstream/3.3.5; then
+            git merge --abort
+            echo "::error::Merge conflict with TrinityCore 3.3.5, resolve it by hand"
+            exit 1
+          fi
+          git -C src/server/game/LuaEngine fetch origin master
+          git -C src/server/game/LuaEngine checkout -q FETCH_HEAD
+          if ! git diff --quiet -- src/server/game/LuaEngine; then
+            git add src/server/game/LuaEngine
+            git commit -m "Update Eluna"
+          fi
+          if [ "$(git rev-parse HEAD)" = "$before" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install dependencies
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang cmake make \
+            libmariadb-dev libmariadb-dev-compat libssl-dev libbz2-dev \
+            libreadline-dev libncurses-dev libboost-all-dev zlib1g-dev
+
+      - name: Build
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DTOOLS=0 -DWITH_WARNINGS=0 -DSCRIPTS=static
+          cmake --build build -j"$(nproc)"
+
+      - name: Push
+        if: steps.merge.outputs.changed == 'true'
+        run: git push origin HEAD:3.3.5
